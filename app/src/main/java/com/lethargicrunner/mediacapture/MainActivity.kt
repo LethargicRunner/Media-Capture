@@ -59,7 +59,7 @@ class MainActivity : Activity() {
 
         addressBar = EditText(this).apply {
             hint = "Adresse du site"
-            singleLine = true
+            maxLines = 1
             inputType =  UriInputType
             imeOptions = EditorInfo.IME_ACTION_GO
             setText("https://")
