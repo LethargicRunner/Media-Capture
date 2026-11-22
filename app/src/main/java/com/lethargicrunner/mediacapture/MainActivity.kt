@@ -1,6 +1,14 @@
 package com.lethargicrunner.mediacapture
 
 import android.app.Activity
+import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Bundle
 import android.graphics.Color
 import android.view.View
@@ -26,6 +34,35 @@ class MainActivity : Activity() {
     private lateinit var addressBar: EditText
     private lateinit var mediaList: TextView
     private lateinit var statusText: TextView
+    private lateinit var captureStatusText: TextView
+
+    private var captureRequestPending = false
+    private var receiverRegistered = false
+
+    private val captureStatusReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != AudioCaptureService.ACTION_STATUS) return
+
+            val status = intent.getStringExtra(
+                AudioCaptureService.EXTRA_STATUS
+            ) ?: "Statut de capture inconnu"
+
+            val filePath = intent.getStringExtra(
+                AudioCaptureService.EXTRA_FILE_PATH
+            ) ?: ""
+
+            if (status.startsWith("CAPTURE TERMINEE") ||
+                status.startsWith("ERREUR")) {
+                captureRequestPending = false
+            }
+
+            captureStatusText.text = if (filePath.isNotBlank()) {
+                "$status\nFichier : $filePath"
+            } else {
+                status
+            }
+        }
+    }
 
     private val detectedMedia = Collections.synchronizedSet(
         LinkedHashSet<String>()
@@ -95,6 +132,50 @@ class MainActivity : Activity() {
             setPadding(0, 8, 0, 8)
         }
         root.addView(statusText)
+
+        captureStatusText = TextView(this).apply {
+            text = "Capture audio : inactive"
+            textSize = 13f
+            setTextColor(Color.DKGRAY)
+            setPadding(0, 4, 0, 8)
+        }
+        root.addView(captureStatusText)
+
+        val captureRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+
+        val captureButton = Button(this).apply {
+            text = "Capturer le son"
+            setOnClickListener {
+                beginAudioCapture()
+            }
+        }
+
+        val stopCaptureButton = Button(this).apply {
+            text = "Arrêter"
+            setOnClickListener {
+                stopAudioCapture()
+            }
+        }
+
+        captureRow.addView(
+            captureButton,
+            LinearLayout.LayoutParams(
+                0,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                1f
+            )
+        )
+        captureRow.addView(
+            stopCaptureButton,
+            LinearLayout.LayoutParams(
+                0,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                1f
+            )
+        )
+        root.addView(captureRow)
 
         val mediaScroll = ScrollView(this).apply {
             setBackgroundColor(0xFFF0F0F0.toInt())
@@ -200,7 +281,143 @@ class MainActivity : Activity() {
 
         setContentView(root)
 
+        registerCaptureReceiver()
+
         webView.loadUrl("https://www.google.com")
+    }
+
+    private fun beginAudioCapture() {
+        if (captureRequestPending) {
+            captureStatusText.text = "Une capture est déjà en cours ou demandée."
+            return
+        }
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            captureStatusText.text = "Android 10 minimum requis."
+            return
+        }
+
+        captureRequestPending = true
+
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(
+                arrayOf(Manifest.permission.RECORD_AUDIO),
+                REQUEST_AUDIO_PERMISSION
+            )
+            return
+        }
+
+        requestMediaProjectionPermission()
+    }
+
+    private fun requestMediaProjectionPermission() {
+        val manager = getSystemService(
+            Context.MEDIA_PROJECTION_SERVICE
+        ) as MediaProjectionManager
+
+        captureStatusText.text = "En attente de l'autorisation de capture système."
+
+        startActivityForResult(
+            manager.createScreenCaptureIntent(),
+            REQUEST_MEDIA_PROJECTION
+        )
+    }
+
+    private fun stopAudioCapture() {
+        val intent = Intent(
+            this,
+            AudioCaptureService::class.java
+        ).apply {
+            action = AudioCaptureService.ACTION_STOP
+        }
+
+        startService(intent)
+        captureStatusText.text = "Arrêt de la capture demandé."
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(
+            requestCode,
+            permissions,
+            grantResults
+        )
+
+        if (requestCode != REQUEST_AUDIO_PERMISSION) return
+
+        if (grantResults.isNotEmpty() &&
+            grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            requestMediaProjectionPermission()
+        } else {
+            captureRequestPending = false
+            captureStatusText.text =
+                "Permission audio refusée. Capture impossible."
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(
+        requestCode: Int,
+        resultCode: Int,
+        data: Intent?
+    ) {
+        super.onActivityResult(requestCode, resultCode, data)
+
+        if (requestCode != REQUEST_MEDIA_PROJECTION) return
+
+        if (resultCode != RESULT_OK || data == null) {
+            captureRequestPending = false
+            captureStatusText.text =
+                "Autorisation de capture système refusée."
+            return
+        }
+
+        val serviceIntent = Intent(
+            this,
+            AudioCaptureService::class.java
+        ).apply {
+            action = AudioCaptureService.ACTION_START
+            putExtra(
+                AudioCaptureService.EXTRA_RESULT_CODE,
+                resultCode
+            )
+            putExtra(
+                AudioCaptureService.EXTRA_PROJECTION_DATA,
+                data
+            )
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent)
+        } else {
+            startService(serviceIntent)
+        }
+
+        captureStatusText.text = "Démarrage de la capture audio..."
+    }
+
+    @Suppress("DEPRECATION")
+    private fun registerCaptureReceiver() {
+        val filter = IntentFilter(
+            AudioCaptureService.ACTION_STATUS
+        )
+
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(
+                captureStatusReceiver,
+                filter,
+                Context.RECEIVER_NOT_EXPORTED
+            )
+        } else {
+            registerReceiver(captureStatusReceiver, filter)
+        }
+
+        receiverRegistered = true
     }
 
     private fun openAddress(raw: String) {
@@ -251,6 +468,20 @@ class MainActivity : Activity() {
         }
     }
 
+    @Suppress("DEPRECATION")
+    override fun onDestroy() {
+        if (receiverRegistered) {
+            unregisterReceiver(captureStatusReceiver)
+            receiverRegistered = false
+        }
+
+        if (::webView.isInitialized) {
+            webView.destroy()
+        }
+
+        super.onDestroy()
+    }
+
     override fun onBackPressed() {
         if (::webView.isInitialized && webView.canGoBack()) {
             webView.goBack()
@@ -261,5 +492,7 @@ class MainActivity : Activity() {
 
     companion object {
         private const val UriInputType = 17
+        private const val REQUEST_AUDIO_PERMISSION = 5101
+        private const val REQUEST_MEDIA_PROJECTION = 5102
     }
 }
