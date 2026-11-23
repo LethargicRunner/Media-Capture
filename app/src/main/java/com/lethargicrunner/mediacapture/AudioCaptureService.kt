@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -15,14 +16,19 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
+import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.io.RandomAccessFile
+import java.io.OutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -32,13 +38,8 @@ class AudioCaptureService : Service() {
     private var projection: MediaProjection? = null
     private var audioRecord: AudioRecord? = null
     private var captureThread: Thread? = null
-    private var outputFile: File? = null
-
     @Volatile
     private var recording = false
-
-    @Volatile
-    private var dataBytes = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -64,6 +65,22 @@ class AudioCaptureService : Service() {
         }
 
         val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
+        val requestedBitrate = intent?.getIntExtra(
+            EXTRA_BITRATE,
+            DEFAULT_BITRATE_KBPS
+        ) ?: DEFAULT_BITRATE_KBPS
+        val bitrate = if (requestedBitrate in ALLOWED_BITRATES) {
+            requestedBitrate
+        } else {
+            DEFAULT_BITRATE_KBPS
+        }
+        val channels = if (
+            intent?.getIntExtra(EXTRA_CHANNELS, DEFAULT_CHANNELS) == 1
+        ) 1 else 2
+        val outputTree = intent
+            ?.getStringExtra(EXTRA_OUTPUT_TREE_URI)
+            ?.takeIf { it.isNotBlank() }
+            ?.let { Uri.parse(it) }
         val projectionData = getProjectionIntent(intent)
 
         if (projectionData == null) {
@@ -97,9 +114,9 @@ class AudioCaptureService : Service() {
                 Handler(Looper.getMainLooper())
             )
 
-            startAudioCapture(currentProjection)
+            startAudioCapture(currentProjection, bitrate, channels, outputTree)
 
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             sendStatus("ERREUR : ${e.message ?: e.javaClass.simpleName}")
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -183,7 +200,137 @@ class AudioCaptureService : Service() {
         }
     }
 
-    private fun startAudioCapture(mediaProjection: MediaProjection) {
+    private class OutputTarget(
+        val stream: OutputStream,
+        val label: String,
+        val uri: Uri?,
+        val file: File?
+    )
+
+    /**
+     * Ordre d'essai : dossier choisi (Storage Access Framework), puis Téléchargements
+     * (MediaStore), puis dossier privé de l'application.
+     */
+    private fun openOutput(outputTree: Uri?): OutputTarget {
+        val timestamp = SimpleDateFormat(
+            "yyyyMMdd_HHmmss",
+            Locale.US
+        ).format(Date())
+
+        val name = "capture_$timestamp.mp3"
+
+        if (outputTree != null) {
+            try {
+                val parent = DocumentsContract.buildDocumentUriUsingTree(
+                    outputTree,
+                    DocumentsContract.getTreeDocumentId(outputTree)
+                )
+                val document = DocumentsContract.createDocument(
+                    contentResolver,
+                    parent,
+                    "audio/mpeg",
+                    name
+                )
+                val stream = document?.let { contentResolver.openOutputStream(it) }
+
+                if (document != null && stream != null) {
+                    return OutputTarget(
+                        stream,
+                        "${folderLabel(outputTree)}/$name",
+                        document,
+                        null
+                    )
+                }
+
+                if (document != null) {
+                    try {
+                        DocumentsContract.deleteDocument(contentResolver, document)
+                    } catch (_: Exception) {
+                    }
+                }
+            } catch (_: Exception) {
+                // Dossier inaccessible (permission retirée, dossier supprimé...) : repli.
+            }
+        }
+
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, name)
+            put(MediaStore.Downloads.MIME_TYPE, "audio/mpeg")
+            put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+        }
+
+        val uri = contentResolver.insert(
+            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+            values
+        )
+        val stream = uri?.let { contentResolver.openOutputStream(it) }
+
+        if (uri != null && stream != null) {
+            return OutputTarget(
+                stream,
+                "${Environment.DIRECTORY_DOWNLOADS}/$name",
+                uri,
+                null
+            )
+        }
+
+        // Dernier repli : dossier privé de l'application.
+        if (uri != null) {
+            try {
+                contentResolver.delete(uri, null, null)
+            } catch (_: Exception) {
+            }
+        }
+
+        val directory = getExternalFilesDir(Environment.DIRECTORY_MUSIC)
+            ?: filesDir
+        directory.mkdirs()
+
+        val file = File(directory, name)
+        return OutputTarget(
+            FileOutputStream(file),
+            file.absolutePath,
+            null,
+            file
+        )
+    }
+
+    private fun deleteOutput(target: OutputTarget) {
+        try {
+            target.uri?.let {
+                if (DocumentsContract.isDocumentUri(this, it)) {
+                    DocumentsContract.deleteDocument(contentResolver, it)
+                } else {
+                    contentResolver.delete(it, null, null)
+                }
+            }
+            target.file?.delete()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun formatDuration(frames: Long): String {
+        val seconds = frames / SAMPLE_RATE
+        return String.format(
+            Locale.US,
+            "%d:%02d",
+            seconds / 60,
+            seconds % 60
+        )
+    }
+
+    private fun startAudioCapture(
+        mediaProjection: MediaProjection,
+        bitrate: Int,
+        channels: Int,
+        outputTree: Uri?
+    ) {
+        val channelMask = if (channels == 1) {
+            AudioFormat.CHANNEL_IN_MONO
+        } else {
+            AudioFormat.CHANNEL_IN_STEREO
+        }
+
         val config = AudioPlaybackCaptureConfiguration.Builder(
             mediaProjection
         )
@@ -195,12 +342,12 @@ class AudioCaptureService : Service() {
         val format = AudioFormat.Builder()
             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
             .setSampleRate(SAMPLE_RATE)
-            .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+            .setChannelMask(channelMask)
             .build()
 
         val minimumBuffer = AudioRecord.getMinBufferSize(
             SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO,
+            channelMask,
             AudioFormat.ENCODING_PCM_16BIT
         )
 
@@ -210,90 +357,130 @@ class AudioCaptureService : Service() {
             )
         }
 
-        val bufferSize = maxOf(minimumBuffer * 2, 8192)
+        // Taille en octets ; on lit ensuite en ShortArray (2 octets par valeur).
+        val bufferSize = maxOf(minimumBuffer * 2, 16384)
 
-        val recorder = AudioRecord.Builder()
-            .setAudioFormat(format)
-            .setBufferSizeInBytes(bufferSize)
-            .setAudioPlaybackCaptureConfig(config)
-            .build()
+        val encoder = Mp3Encoder(SAMPLE_RATE, channels, bitrate)
+
+        val target = try {
+            openOutput(outputTree)
+        } catch (e: Exception) {
+            encoder.close()
+            throw e
+        }
+
+        val recorder = try {
+            AudioRecord.Builder()
+                .setAudioFormat(format)
+                .setBufferSizeInBytes(bufferSize)
+                .setAudioPlaybackCaptureConfig(config)
+                .build()
+        } catch (e: Exception) {
+            encoder.close()
+            try {
+                target.stream.close()
+            } catch (_: Exception) {
+            }
+            deleteOutput(target)
+            throw e
+        }
 
         if (recorder.state != AudioRecord.STATE_INITIALIZED) {
             recorder.release()
+            encoder.close()
+            try {
+                target.stream.close()
+            } catch (_: Exception) {
+            }
+            deleteOutput(target)
             throw IllegalStateException("AudioRecord non initialisé")
         }
 
-        val musicDirectory = getExternalFilesDir(
-            Environment.DIRECTORY_MUSIC
-        ) ?: filesDir
-
-        if (!musicDirectory.exists()) {
-            musicDirectory.mkdirs()
-        }
-
-        val timestamp = SimpleDateFormat(
-            "yyyyMMdd_HHmmss",
-            Locale.US
-        ).format(Date())
-
-        val file = File(
-            musicDirectory,
-            "capture_$timestamp.wav"
-        )
-
         audioRecord = recorder
-        outputFile = file
-        dataBytes = 0L
 
-        recorder.startRecording()
+        try {
+            recorder.startRecording()
+        } catch (e: Exception) {
+            recorder.release()
+            audioRecord = null
+            encoder.close()
+            try {
+                target.stream.close()
+            } catch (_: Exception) {
+            }
+            deleteOutput(target)
+            throw e
+        }
 
         if (recorder.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
             recorder.release()
             audioRecord = null
+            encoder.close()
+            try {
+                target.stream.close()
+            } catch (_: Exception) {
+            }
+            deleteOutput(target)
             throw IllegalStateException("AudioRecord n'a pas démarré")
         }
 
         recording = true
-        sendStatus("CAPTURE EN COURS")
+        startedAtMs = SystemClock.elapsedRealtime()
+        capturing = true
+        val modeLabel = if (channels == 1) "mono" else "stéréo"
+        sendStatus("CAPTURE EN COURS (MP3 $bitrate kb/s, $modeLabel)")
 
         captureThread = Thread {
             var errorMessage: String? = null
+            var totalFrames = 0L
 
             try {
-                FileOutputStream(file).use { output ->
-                    output.write(ByteArray(44))
+                val output = BufferedOutputStream(target.stream, 16 * 1024)
+                val pcm = ShortArray(bufferSize / 2)
+                val mp3 = ByteArray(
+                    encoder.maxOutputSize(pcm.size / channels)
+                )
 
-                    val buffer = ByteArray(bufferSize)
+                while (recording) {
+                    val count = recorder.read(pcm, 0, pcm.size)
 
-                    while (recording) {
-                        val count = recorder.read(
-                            buffer,
-                            0,
-                            buffer.size
-                        )
-
-                        if (count > 0) {
-                            output.write(buffer, 0, count)
-                            dataBytes += count
-                        } else if (
-                            count == AudioRecord.ERROR_DEAD_OBJECT ||
-                            count == AudioRecord.ERROR_INVALID_OPERATION
-                        ) {
-                            break
+                    if (count > 0) {
+                        val written = encoder.encode(pcm, count, mp3)
+                        if (written > 0) {
+                            output.write(mp3, 0, written)
                         }
+                        totalFrames += count / channels
+                    } else if (
+                        count == AudioRecord.ERROR_DEAD_OBJECT ||
+                        count == AudioRecord.ERROR_INVALID_OPERATION
+                    ) {
+                        // Arrêt normal : stop() fait échouer la lecture en cours.
+                        break
+                    } else if (count < 0) {
+                        errorMessage = "Lecture audio : code $count"
+                        break
                     }
-
-                    output.flush()
                 }
+
+                val tail = encoder.flush(mp3)
+                if (tail > 0) {
+                    output.write(mp3, 0, tail)
+                }
+                output.flush()
+                output.close()
             } catch (e: Exception) {
                 errorMessage = e.message ?: e.javaClass.simpleName
+                try {
+                    target.stream.close()
+                } catch (_: Exception) {
+                }
             } finally {
                 recording = false
+                capturing = false
 
                 try {
-                    writeWavHeader(file, dataBytes)
-                } catch (e: Exception) {
-                    errorMessage = "En-tête WAV : ${e.message}"
+                    encoder.close()
+                } catch (_: Exception) {
                 }
 
                 try {
@@ -310,13 +497,23 @@ class AudioCaptureService : Service() {
 
                 projection = null
 
-                val finalMessage = if (errorMessage == null) {
-                    "CAPTURE TERMINEE"
-                } else {
-                    "ERREUR : $errorMessage"
+                if (totalFrames == 0L) {
+                    deleteOutput(target)
                 }
 
-                sendStatus(finalMessage, file.absolutePath)
+                val finalMessage = when {
+                    errorMessage != null -> "ERREUR : $errorMessage"
+                    totalFrames == 0L ->
+                        "CAPTURE TERMINEE : aucun son capturé " +
+                            "(application non capturable ou rien en lecture)"
+                    else ->
+                        "CAPTURE TERMINEE (${formatDuration(totalFrames)})"
+                }
+
+                sendStatus(
+                    finalMessage,
+                    if (totalFrames == 0L) "" else target.label
+                )
 
                 Handler(Looper.getMainLooper()).post {
                     stopForeground(STOP_FOREGROUND_REMOVE)
@@ -341,40 +538,6 @@ class AudioCaptureService : Service() {
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
-    }
-
-    private fun writeWavHeader(file: File, audioLength: Long) {
-        RandomAccessFile(file, "rw").use { raf ->
-            raf.seek(0)
-
-            raf.writeBytes("RIFF")
-            writeIntLE(raf, (36 + audioLength).toInt())
-            raf.writeBytes("WAVE")
-
-            raf.writeBytes("fmt ")
-            writeIntLE(raf, 16)
-            writeShortLE(raf, 1)
-            writeShortLE(raf, CHANNELS)
-            writeIntLE(raf, SAMPLE_RATE)
-            writeIntLE(raf, SAMPLE_RATE * CHANNELS * BITS_PER_SAMPLE / 8)
-            writeShortLE(raf, CHANNELS * BITS_PER_SAMPLE / 8)
-            writeShortLE(raf, BITS_PER_SAMPLE)
-
-            raf.writeBytes("data")
-            writeIntLE(raf, audioLength.toInt())
-        }
-    }
-
-    private fun writeIntLE(file: RandomAccessFile, value: Int) {
-        file.write(value and 0xFF)
-        file.write((value shr 8) and 0xFF)
-        file.write((value shr 16) and 0xFF)
-        file.write((value shr 24) and 0xFF)
-    }
-
-    private fun writeShortLE(file: RandomAccessFile, value: Int) {
-        file.write(value and 0xFF)
-        file.write((value shr 8) and 0xFF)
     }
 
     private fun sendStatus(status: String, path: String = "") {
@@ -416,12 +579,36 @@ class AudioCaptureService : Service() {
         const val EXTRA_PROJECTION_DATA = "projection_data"
         const val EXTRA_STATUS = "status"
         const val EXTRA_FILE_PATH = "file_path"
+        const val EXTRA_BITRATE = "bitrate_kbps"
+        const val EXTRA_CHANNELS = "channels"
+        const val EXTRA_OUTPUT_TREE_URI = "output_tree_uri"
+
+        const val DEFAULT_BITRATE_KBPS = 192
+        const val DEFAULT_CHANNELS = 2
+        val ALLOWED_BITRATES = listOf(128, 192, 256, 320)
+
+        /** Nom lisible d'un dossier choisi via le sélecteur Android (ex. « Music/Captures »). */
+        fun folderLabel(treeUri: Uri): String {
+            val documentId = try {
+                DocumentsContract.getTreeDocumentId(treeUri)
+            } catch (_: Exception) {
+                return treeUri.toString()
+            }
+            val path = documentId.substringAfter(':', "")
+            return if (path.isBlank()) "Stockage" else path
+        }
+
+        /** Vrai tant qu'une capture est en cours (lu par l'interface). */
+        @Volatile
+        var capturing = false
+
+        /** Instant de début de la capture, en SystemClock.elapsedRealtime(). */
+        @Volatile
+        var startedAtMs = 0L
 
         private const val CHANNEL_ID = "media_capture_audio"
         private const val NOTIFICATION_ID = 4102
 
         private const val SAMPLE_RATE = 44100
-        private const val CHANNELS = 1
-        private const val BITS_PER_SAMPLE = 16
     }
 }
