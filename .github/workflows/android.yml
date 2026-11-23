@@ -36,12 +36,25 @@ jobs:
         run: |
           sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
 
+      - name: Prepare signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "Secret KEYSTORE_BASE64 absent : impossible de signer l'APK."
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/mediacapture.jks"
+          echo "KEYSTORE_PATH=$RUNNER_TEMP/mediacapture.jks" >> "$GITHUB_ENV"
+
       - name: Build APK
-        run: gradle assembleDebug
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: gradle assembleRelease
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Media-Capture-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: Media-Capture
+          path: app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error

@@ -2,6 +2,12 @@ plugins {
     id("com.android.application")
 }
 
+// Numéro de build fourni par GitHub Actions : chaque APK est ainsi une mise à jour valide.
+val buildNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
+// Clé de signature fixe, fournie par le workflow (secrets GitHub).
+val keystorePath: String? = System.getenv("KEYSTORE_PATH")
+val keystorePassword: String? = System.getenv("KEYSTORE_PASSWORD")
+
 android {
     namespace = "com.lethargicrunner.mediacapture"
     compileSdk = 36
@@ -11,12 +17,36 @@ android {
         applicationId = "com.lethargicrunner.mediacapture"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = buildNumber
+        versionName = "0.2.$buildNumber"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
         }
+    }
+
+    signingConfigs {
+        create("fixed") {
+            if (keystorePath != null && keystorePassword != null) {
+                storeFile = file(keystorePath)
+                storePassword = keystorePassword
+                keyAlias = "mediacapture"
+                keyPassword = keystorePassword
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            if (keystorePath != null && keystorePassword != null) {
+                signingConfig = signingConfigs.getByName("fixed")
+            }
+        }
+    }
+
+    lint {
+        checkReleaseBuilds = false
     }
 
     externalNativeBuild {
